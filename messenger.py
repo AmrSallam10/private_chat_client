@@ -1,10 +1,18 @@
 import os 
 import pickle
-from cryptography.exceptions import InvalidSignature
+from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import serialization, hashes, hmac
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import logging
+
+logger = logging.getLogger("messenger")
+handler = logging.StreamHandler()
+formatter = logging.Formatter('%(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+logger.setLevel(logging.DEBUG)
 
 
 class MessengerServer:
@@ -23,9 +31,10 @@ class MessengerClient:
         self.conns = {}
         self.certs = {}
 
-    def generateCertificate(self):
         self.DHs = generate_dh()
 
+    def generateCertificate(self):
+        
         self.certificate = {
             'name': self.name,
             'public_key': self.DHs[1].public_bytes(
@@ -48,22 +57,57 @@ class MessengerClient:
             raise Exception("Invalid signature! The certificate has been tampered with.")
 
     def sendMessage(self, name, message):
-        if name not in self.conns or 'cks' not in self.conns[name]: 
-            pr_k, pu_k = generate_dh()
-            remote_pub = serialization.load_pem_public_key(self.certs[name]['public_key'])
-            shared_key = dh((pr_k, pu_k), self.certs[name]['public_key'])
-            rk, cks = kdf_rk(None, shared_key)
+        logger.debug("##################################################################")
+        logger.debug(f"[{self.name}]: Sending message to: [{name}]")
+        if name not in self.conns:
+            logger.debug(f"[{self.name}]: No connection with {name} yet")
+            remote_pub = serialization.load_pem_public_key(self.certs[name]['public_key']) 
+            logger.debug(f"[{self.name}]: Using initial pub key for [{name}]")
+            pr_k, pu_k = self.DHs
+            logger.debug(f"[{self.name}]: Using initial key pair")
+            shared_key = dh(pr_k, remote_pub)
+            logger.debug(f"[{self.name}]: DH key exchange")
+            rk, cks = kdf_rk(shared_key , shared_key)
+            logger.debug(f"[{self.name}]: Derive new RK, CKs")
             self.conns[name] = {
                 'rk': rk,
                 'cks': cks,
+                'ckr': None,
                 'remote_pub': remote_pub,
                 'local_pr': pr_k,
-                'local_pub': pu_k
+                'local_pub': pu_k,
+                'last_to_send': True
             }
+            logger.debug(f"[{self.name}]: Last to send")
+        elif (self.conns[name]['cks'] is None) or (not self.conns[name]['last_to_send']):
+            if self.conns[name]['cks'] is None:
+                logger.debug(f"[{self.name}]: Sending for the first time to [{name}]")
+            else:
+                logger.debug(f"[{self.name}]: Sending after receiving from [{name}]")
+            remote_pub = self.conns[name]['remote_pub']
+            logger.debug(f"[{self.name}]: Using stored pub key for [{name}]")
+            pr_k, pu_k = generate_dh()
+            logger.debug(f"[{self.name}]: Generating new key pair")
+            shared_key = dh(pr_k, remote_pub)
+            logger.debug(f"[{self.name}]: DH key exchange")
+            rk, cks = kdf_rk(self.conns[name]['rk'] , shared_key)
+            logger.debug(f"[{self.name}]: Deriving new RK, CKs")
+            self.conns[name] = {
+                'rk': rk,
+                'cks': cks,
+                'ckr': self.conns[name]['ckr'],
+                'remote_pub': remote_pub,
+                'local_pr': pr_k,
+                'local_pub': pu_k,
+                'last_to_send': True
+            }
+            logger.debug(f"[{self.name}]: Last to send")
+            
         session = self.conns[name]
         session['cks'], mk = kdf_ck(session['cks'])
-        # print(mk)
+        logger.debug(f"[{self.name}]: Deriving new CKs, MK")
         nonce, ciphertext = encrypt(mk, message)
+        logger.debug(f"[{self.name}]: Encrypting message")
         header = {
             'nonce': nonce,
             'public_key': session['local_pub'].public_bytes(
@@ -74,34 +118,72 @@ class MessengerClient:
         return header, ciphertext
 
     def receiveMessage(self, name, header, ciphertext):
-        print("Receiving message from", name)
+        logger.debug("-------------------------------")
+        logger.debug(f"[{self.name}]: Received message from: [{name}]")
         if name not in self.conns:
+            logger.debug(f"[{self.name}]: No connection with [{name}] yet")
             pr_k, pu_k = self.DHs
+            logger.debug(f"[{self.name}]: Using initial key pair")
             remote_pub = serialization.load_pem_public_key(header['public_key'])
-            shared_key = dh((pr_k, pu_k), header['public_key'])
-            rk, ckr = kdf_rk(None, shared_key)
+            logger.debug(f"[{self.name}]: Using pub key in header for [{name}]")
+            shared_key = dh(pr_k, remote_pub)
+            logger.debug(f"[{self.name}]: DH key exchange")
+            rk, ckr = kdf_rk(shared_key, shared_key)
+            logger.debug(f"[{self.name}]: Deriving new RK, CKr")
             self.conns[name] = {
                 'rk': rk,
+                'cks': None,   
                 'ckr': ckr,
                 'remote_pub': remote_pub,
                 'local_pr': pr_k,
-                'local_pub': pu_k
+                'local_pub': pu_k,
+                'last_to_send': False
             }
+            logger.debug(f"[{self.name}]: Not last to send")
+        elif self.conns[name]['ckr'] is None:
+            logger.debug(f"[{self.name}]: Receiving for the first time from [{name}]")
+            pr_k, pu_k = self.conns[name]['local_pr'], self.conns[name]['local_pub']
+            logger.debug(f"[{self.name}]: Using last used key pair in sending")
+            remote_pub = serialization.load_pem_public_key(header['public_key'])
+            logger.debug(f"[{self.name}]: Using pub key from the header of [{name}]")
+            shared_key = dh(pr_k, remote_pub)
+            logger.debug(f"[{self.name}]: DH key exchange")
+            rk, ckr = kdf_rk(self.conns[name]['rk'], shared_key)
+            logger.debug(f"[{self.name}]: Deriving new RK, CKr")
+            self.conns[name] = {
+                'rk': rk,
+                'cks': self.conns[name]['cks'],
+                'ckr': ckr,
+                'remote_pub': remote_pub,
+                'local_pr': pr_k,
+                'local_pub': pu_k,
+                'last_to_send': False
+            }
+            logger.debug(f"[{self.name}]: Not last to send")
+
         session = self.conns[name]
         new_remote_pub = serialization.load_pem_public_key(header['public_key'])
         session_pub_key = session['remote_pub'].public_bytes(encoding=serialization.Encoding.PEM, 
                                                              format=serialization.PublicFormat.SubjectPublicKeyInfo)
         if header['public_key'] != session_pub_key:
-            pr_k, pu_k = generate_dh()
-            shared_key = dh((pr_k, pu_k), header['public_key'])
+            logger.debug(f"[{self.name}]: Header of [{name}] changed!")
+            pr_k, pu_k = self.conns[name]['local_pr'], self.conns[name]['local_pub']
+            logger.debug(f"[{self.name}]: Using last used key pair in sending")
+            shared_key = dh(pr_k, new_remote_pub)
+            logger.debug(f"[{self.name}]: DH key exchange")
             session['rk'], session['ckr'] = kdf_rk(session['rk'], shared_key)
+            logger.debug(f"[{self.name}]: Deriving new RK, CKr")
             session['remote_pub'] = new_remote_pub
+            logger.debug(f"[{self.name}]: Updated stored pub key for [{name}]")
             session['local_pr'] = pr_k
-            session['local_pub'] = pu_k            
+            session['local_pub'] = pu_k    
             
+        session['last_to_send'] = False      
         session['ckr'], mk = kdf_ck(session['ckr'])
+        logger.debug(f"[{self.name}]: Deriving new CKr, MK")
         plaintext = decrypt(mk, header['nonce'], ciphertext)
-        return plaintext.decode('utf-8')
+        logger.debug(f"[{self.name}]: Decrypting message")
+        return plaintext.decode('utf-8') if plaintext else None
 
 def generate_dh():
     private_key = ec.generate_private_key(ec.SECP256R1())
@@ -109,14 +191,8 @@ def generate_dh():
 
     return private_key, public_key
 
-def dh(dh_pair, dh_pub):
-    public_key = serialization.load_pem_public_key(
-        dh_pub    
-    )
-
-    shared_key = dh_pair[0].exchange(ec.ECDH(), public_key)
-    
-    return shared_key
+def dh(dh_pr, dh_pub):
+    return dh_pr.exchange(ec.ECDH(), dh_pub)
 
 def kdf_rk(rk, dh_out):
     hkdf = HKDF(
@@ -156,8 +232,10 @@ def decrypt(mk, nonce, ciphertext):
 
     try:
         plaintext = aesgcm.decrypt(nonce, ciphertext, None)
-    except Exception as e:
-        print("Decryption failed: ", e)
-        raise
+    except InvalidTag:
+        logger.debug("Decryption failed")
+        # if e == InvalidTag:
+        return None
+        # raise
 
     return plaintext
